@@ -111,7 +111,7 @@ def get_transaction_with_retry(execution_arn, max_retries=4, delay=0.25):
     return None
 
 def handle_exec_booking(event, location, number):
-    """確認預約，負責換取 Token、喚醒狀態機, 並將櫃位最終確定為 Occupied。"""
+    """確認預約，負責換取 Token、喚醒狀態機, 並將櫃位最終確定為 SoftLocked。"""
     uid = get_user_id(event)
     body = json.loads(event.get('body') or '{}')
     execution_arn = body.get('executionArn')
@@ -132,16 +132,16 @@ def handle_exec_booking(event, location, number):
         logger.error(f"安全性衝突：事務資訊不匹配！")
         return ResponseFormatter.error("憑證資訊與目標櫃位不符", 403)
     
-    # 先更新資料庫資源狀態: Reserved -> Occupied
+    # 先更新資料庫資源狀態: Reserved -> SoftLocked
     try:
         repo.update_locker_status(
             location=location,
             number=number,
-            new_status='Occupied',
+            new_status='SoftLocked',
             expected_status='Reserved'
         )
     except LockerConflictError:
-        logger.error(f"資料庫狀態不一致：櫃位 {location}-{number} 無法更新為 Occupied")
+        logger.error(f"資料庫狀態不一致：櫃位 {location}-{number} 無法更新為 SoftLocked")
         return ResponseFormatter.error("狀態更新衝突，請聯繫管理員", 409)
     
     # 最後才喚醒 Step Functions
@@ -150,7 +150,7 @@ def handle_exec_booking(event, location, number):
         sfn_client.send_task_success(
             taskToken=task_token,
             output=json.dumps({
-                "final_status": "Occupied",
+                "final_status": "SoftLocked",
                 "confirmed_by": uid
             })
         )
@@ -162,6 +162,6 @@ def handle_exec_booking(event, location, number):
         logger.error(f"通知狀態機時發生未預期錯誤: {str(e)}", exc_info=True)
 
     return ResponseFormatter.success(
-        data={"final_status": "Occupied"},
+        data={"final_status": "SoftLocked"},
         message="預約成功！儲物櫃已正式為您保留。"
     )
