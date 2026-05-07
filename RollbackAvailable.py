@@ -23,7 +23,7 @@ transaction_table = dynamodb.Table(TRANSACTION_TABLE_NAME)
 def lambda_handler(event, context):
     """
     負責處理預約超時或失敗後的復原邏輯。
-    1. 將 Locker 狀態由 'Reserved' 還原為 'Available'。
+    1. 將 Locker 狀態由 'SoftLocked' 還原為 'Available'。
     2. 在 LockerTransactions 標記該筆交易為 'TIMEOUT'。
     """
     try:
@@ -45,7 +45,7 @@ def lambda_handler(event, context):
             location=location,
             number=int(number),
             new_status='Available',
-            expected_status='Reserved'  
+            expected_status='SoftLocked'  
         )
         logger.info(f"成功重置儲物櫃資源：{location}-{number} 已恢復為 Available")
 
@@ -61,7 +61,7 @@ def lambda_handler(event, context):
 
     except LockerConflictError:
         # 攔截衝突：如果狀態已非 Reserved，代表這是一筆成功的交易，無需補償
-        logger.warning(f"補償略過：櫃位 {location}-{number} 狀態已非 Reserved，可能已成功佔用。")
+        logger.warning(f"補償略過：櫃位 {location}-{number} 狀態已非 SoftLocked，可能已成功佔用。")
         return {
             "status": "SKIPPED",
             "message": "Locker state changed, compensation skipped."

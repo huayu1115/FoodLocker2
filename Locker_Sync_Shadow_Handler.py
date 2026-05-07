@@ -64,7 +64,7 @@ def sync_locker_status(location, number, locker):
     同一個「door closed」硬體事件，代表什麼業務動作，
     要看 DynamoDB 目前的 Status。
     
-    SoftLocked:
+    Reserved:
       使用者已預約櫃位，外送員正在放餐。
       door closed = 放餐完成。
     
@@ -77,9 +77,9 @@ def sync_locker_status(location, number, locker):
     """
     current_status = locker.get("Status")
     uid = locker.get("Uid")
-    # DB 是 SoftLocked 代表使用者預約後正在放餐。
+    # DB 是 Reserved 代表使用者預約後正在放餐。
     # 關門事件進來後, 放餐完成, 狀態改成 Occupied。
-    if current_status == "SoftLocked":
+    if current_status == "Reserved":
         # 使用 expected_status 做條件更新，避免重複 IoT event 或並發請求
         # 把已經變動的狀態覆蓋掉。
         repo.update_locker_status(
@@ -87,7 +87,7 @@ def sync_locker_status(location, number, locker):
             number=number,
             new_status="Occupied",
             uid=locker.get("Uid"),
-            expected_status="SoftLocked",
+            expected_status="Reserved",
         )
         # 目前同步處理僅更新 DB 狀態，不再依賴 Step Functions TaskToken 通知。
         logger.info("放餐完成，櫃位已轉為使用中: %s-%s", location, number)

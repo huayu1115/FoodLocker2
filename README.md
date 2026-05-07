@@ -28,12 +28,12 @@
 
 - **負責的 API**
   - **API: `POST {apiUrl}/lockers/{Location}/{Number}/start-booking`**
-    - 描述：使用者點擊可用櫃位後發起，將資料庫狀態由 Available 轉為 Reserved（暫鎖狀態），並啟動 Saga 事務追蹤。
+    - 描述：使用者點擊可用櫃位後發起，將資料庫狀態由 Available 轉為 SoftLocked（暫鎖狀態），並啟動 Saga 事務追蹤。
   - **API: `POST {apiUrl}/lockers/{Location}/{Number}/exec-booking`**
     - 描述：使用者完成最終確認後發起，帶回事務憑證（executionArn），告知系統該筆預約正式生效。
 
 - **功能**
-  - **原子性狀態寫入**：在 `start-booking` 階段使用 DynamoDB 的 `ConditionExpression`，確保只有在櫃位狀態為 `Available` 時才能成功更新為 `Reserved`，徹底防止 Race Condition。
+  - **原子性狀態寫入**：在 `start-booking` 階段使用 DynamoDB 的 `ConditionExpression`，確保只有在櫃位狀態為 `Available` 時才能成功更新為 `SoftLocked`，徹底防止 Race Condition。
   - **憑證換取邏輯**：在 `exec-booking` 階段，Lambda 會查詢 `LockerTransactions` 資料表，根據 `executionArn` 提取由狀態機產生的 `taskToken`，實現非同步工作流的同步確認。
   - **分散式交易管理**：啟動 **AWS Step Functions** 工作流。若 5 分鐘內未收到 `exec-booking` 請求，狀態機將自動觸發 `RollbackAvailable` Lambda，將資料庫狀態重置回 `Available` 以供他人使用。
 
@@ -66,7 +66,7 @@
     - 描述：當預約工作流超過 5 分鐘未收到確認，或流程中發生非預期錯誤時，由狀態機自動觸發執行。
 
 - **核心功能**
-  - **原子性狀態重置**：利用 DynamoDB 的條件寫入機制，確保僅在櫃位狀態仍處於 `Reserved`（暫鎖）時執行重置，這能有效避免覆蓋掉在超時邊緣剛好成功的合法預約（已轉為 `Occupied`）。
+  - **原子性狀態重置**：利用 DynamoDB 的條件寫入機制，確保僅在櫃位狀態仍處於 `SoftLocked`（暫鎖）時執行重置，這能有效避免覆蓋掉在超時邊緣剛好成功的合法預約（已轉為 `Reserved`）。
   - **資源與事務同步初始化**：
     1. **儲物櫃表 (Lockers)**：將狀態恢復為 `Available` 並移除 `Uid` 欄位，釋放實體櫃位供後續搜尋。
     2. **事務表 (LockerTransactions)**：將對應的 `ExecutionArn` 紀錄標記為 `TIMEOUT` 或 `ROLLED_BACK`，建立完整的審計追蹤路徑。
