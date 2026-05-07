@@ -13,18 +13,20 @@ repo = LockerRepository()
 
 
 def get_locker_number(event):
-    # 這個 handler 只處理 AWS IoT Rule 轉來的 Shadow event。
-    # 不處理 API Gateway，也不處理前端直接呼叫。
-    #
-    # IoT Rule 只會用 Named Shadow topic 觸發這支 Lambda。
-    # 固定格式: $aws/things/locker-pi/shadow/name/3
-    # 最後一段 3 就是 DynamoDB 的 Number。
-    #
+    """
+    這個 handler 只處理 AWS IoT Rule 轉來的 Shadow event。
+    不處理 API Gateway，也不處理前端直接呼叫。
+
+    IoT Rule 只會用 Named Shadow topic 觸發這支 Lambda。
+    固定格式: $aws/things/locker-pi/shadow/name/3
+    最後一段 3 就是 DynamoDB 的 Number。
+    
     # 例如:
     # topic = "$aws/things/locker-pi/shadow/name/3"
     # parts[-1] = "3"
-    #
+    
     # 如果 topic 不存在或最後一段不是數字，代表 IoT Rule 格式不符合預期。
+    """
     topic = event.get("topic")
     if not isinstance(topic, str):
         return None
@@ -40,11 +42,13 @@ def get_locker_number(event):
 
 
 def response_data(location, number, status=None, reported=None):
-    # 統一整理 Lambda response 裡的 data。
-    # 這不是業務邏輯，只是讓成功/錯誤回應都帶相同的除錯資訊。
-    #
-    # reported 來自 Device Shadow 的 state.reported。
-    # 目前只回傳 door_sensor / lock_status，方便 CloudWatch 或測試時確認硬體狀態。
+    """
+    統一整理 Lambda response 裡的 data。
+    這不是業務邏輯，只是讓成功/錯誤回應都帶相同的除錯資訊。
+    
+    reported 來自 Device Shadow 的 state.reported。
+    目前只回傳 door_sensor / lock_status，方便 CloudWatch 或測試時確認硬體狀態。
+    """
     data = {"location": location, "number": number}
     if status:
         data["status"] = status
@@ -55,23 +59,24 @@ def response_data(location, number, status=None, reported=None):
 
 
 def sync_locker_status(location, number, locker):
-    # 這裡是整支 Lambda 的核心判斷:
-    # 同一個「door closed」硬體事件，代表什麼業務動作，
-    # 要看 DynamoDB 目前的 Status。
-    #
-    # Reserved:
-    #   使用者已預約櫃位，外送員正在放餐。
-    #   door closed = 放餐完成。
-    #
-    # Occupied:
-    #   餐點已在櫃內，使用者正在取餐。
-    #   door closed = 取餐完成。
-    #
-    # 其他狀態:
-    #   例如 Available / Maintenance，不應被硬體關門事件改動。
+    """
+    這裡是整支 Lambda 的核心判斷:
+    同一個「door closed」硬體事件，代表什麼業務動作，
+    要看 DynamoDB 目前的 Status。
+    
+    Reserved:
+      使用者已預約櫃位，外送員正在放餐。
+      door closed = 放餐完成。
+    
+    Occupied:
+      餐點已在櫃內，使用者正在取餐。
+      door closed = 取餐完成。
+    
+    其他狀態:
+       例如 Available / Maintenance，不應被硬體關門事件改動。
+    """
     current_status = locker.get("Status")
     uid = locker.get("Uid")
-
     # DB 是 Reserved 代表使用者預約後正在放餐。
     # 關門事件進來後, 放餐完成, 狀態改成 Occupied。
     if current_status == "Reserved":
@@ -123,24 +128,25 @@ def sync_locker_status(location, number, locker):
 
 
 def lambda_handler(event, context):
-    # 預期 event 範例:
-    #
-    # {
-    #   "topic": "$aws/things/locker-pi/shadow/name/3",
-    #   "state": {
-    #     "reported": {
-    #       "door_sensor": "closed",
-    #       "lock_status": "locked",
-    #       "box_empty": true
-    #     }
-    #   }
-    # }
-    #
-    # topic 負責提供櫃號。
-    # state.reported 負責提供硬體狀態。
-    #
-    # Location 不在 IoT topic 裡, 所以由 Lambda 環境變數提供。
-    # Number 從 event["topic"] 解析。
+    """
+    預期 event 範例:
+    
+     {
+       "topic": "$aws/things/locker-pi/shadow/name/3",
+       "state": {
+         "reported": {
+           "door_sensor": "closed",
+           "lock_status": "locked",
+           "box_empty": true
+         }
+       }
+     }
+    
+     topic 負責提供櫃號。
+     state.reported 負責提供硬體狀態。
+     Location 不在 IoT topic 裡, 所以由 Lambda 環境變數提供。
+     Number 從 event["topic"] 解析。
+    """
     location = os.environ.get("DEFAULT_LOCATION")
     number = get_locker_number(event or {})
     if not location or number is None:
