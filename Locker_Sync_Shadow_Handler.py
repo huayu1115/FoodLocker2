@@ -136,8 +136,7 @@ def lambda_handler(event, context):
        "state": {
          "reported": {
            "door_sensor": "closed",
-           "lock_status": "locked",
-           "box_empty": true
+           "lock_status": "locked"
          }
        }
      }
@@ -156,6 +155,15 @@ def lambda_handler(event, context):
     # Shadow payload 固定讀 state.reported。
     # 目前只用 door_sensor 判斷使用者是否完成開門後的動作。
     reported = (event.get("state") or {}).get("reported") or {}
+
+    # 判斷是否為初始化訊息
+    if reported.get("init") is True:
+        logger.info("忽略櫃位開機初始化 Shadow 狀態：%s-%s", location, number)
+        return ResponseFormatter.success(
+            data=response_data(location, number, reported=reported),
+            message="忽略櫃位開機初始化 Shadow 狀態",
+        )
+
     # 目前只看門是否關上。
     # lock_status / box_empty 暫時不參與判斷，避免硬體感測不穩造成誤同步。
     if reported.get("door_sensor") != "closed":
