@@ -51,7 +51,8 @@ class LockerRepository:
         try:
             # 使用 Query 而非 Scan，效能與成本最佳化
             response = self.table.query(
-                KeyConditionExpression="Location = :loc",
+                KeyConditionExpression="#loc = :loc",
+                ExpressionAttributeNames={"#loc": "Location"},
                 ExpressionAttributeValues={":loc": location}
             )
             return response.get('Items', [])
