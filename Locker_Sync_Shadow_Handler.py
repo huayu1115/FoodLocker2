@@ -2,6 +2,9 @@ import json
 import logging
 import os
 
+import boto3
+from botocore.exceptions import ClientError
+
 from locker_repository import LockerConflictError, LockerRepository, LockerRepositoryError
 from response import ResponseFormatter
 
@@ -9,7 +12,86 @@ from response import ResponseFormatter
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+sqs_client = boto3.client("sqs")
+cognito_client = boto3.client("cognito-idp")
+SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")
+USER_POOL_ID = os.environ.get("USER_POOL_ID")
+
 repo = LockerRepository()
+
+
+def get_user_email(uid):
+    """
+    Shadow event 本身沒有 Cognito claims。
+    這裡用 Lockers 表裡保存的 Uid 回 Cognito 查使用者 email，讓通知 Worker 可以寄信。
+    """
+    if not USER_POOL_ID:
+        logger.error("Environment variable USER_POOL_ID is not configured, cannot query user email.")
+        return None
+    if not uid:
+        logger.warning("櫃位資料缺少 Uid，無法查詢使用者 Email。")
+        return None
+
+    try:
+        response = cognito_client.list_users(
+            UserPoolId=USER_POOL_ID,
+            Filter=f'sub = "{uid}"',
+            Limit=1,
+        )
+    except ClientError as error:
+        logger.error("查詢 Cognito 使用者 Email 失敗: %s", str(error))
+        return None
+
+    users = response.get("Users", [])
+    if not users:
+        logger.warning("找不到 Cognito 使用者 sub: %s", uid)
+        return None
+
+    for attribute in users[0].get("Attributes", []):
+        if attribute.get("Name") == "email":
+            return attribute.get("Value")
+
+    logger.warning("Cognito 使用者 %s 沒有 email 屬性。", uid)
+    return None
+
+
+
+def enqueue_shadow_notification(location, number, user_email, uid=None):
+    """
+    Shadow 關門後代表外送員放餐完成，需要更換使用者取餐密碼。
+    做法跟 exec-booking 一樣，把任務包成 JSON 後送到 SQS 佇列。
+    將更換取餐密碼的任務送到 SQS。
+    Notification_Shadow_Sync_Worker 會接手更新 IoT Shadow 密碼，並把新密碼寄到 email。
+    """
+    if not SQS_QUEUE_URL:
+        logger.error("Environment variable SQS_QUEUE_URL is not configured, skipping SQS push.")
+        return
+
+    payload = {
+        "action": "refresh_user_otp",
+        "location": location,
+        "number": number,
+        "email": user_email,
+    }
+    if uid:
+        payload["uid"] = uid
+
+    if not user_email:
+        logger.warning("櫃位 %s-%s 缺少使用者 Email，通知 Worker 將無法寄信。", location, number)
+
+    try:
+        logger.info("Sending Shadow OTP refresh job to SQS: %s", payload)
+        sqs_client.send_message(
+            QueueUrl=SQS_QUEUE_URL,
+            MessageBody=json.dumps(payload),
+        )
+    except ClientError as error:
+        logger.critical(
+            "Unable to write Shadow OTP refresh job to SQS for locker %s-%s: %s",
+            location,
+            number,
+            str(error),
+        )
 
 
 def get_locker_number(event):
@@ -91,6 +173,8 @@ def sync_locker_status(location, number, locker):
         )
         # 目前同步處理僅更新 DB 狀態，不再依賴 Step Functions TaskToken 通知。
         logger.info("放餐完成，櫃位已轉為使用中: %s-%s", location, number)
+        user_email = get_user_email(locker.get("Uid"))
+        enqueue_shadow_notification(location, number, user_email, uid=locker.get("Uid"))
         return ResponseFormatter.success(
             data=response_data(location, number, "Occupied"),
             message="櫃位已更新為使用中",
