@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import secrets
 import boto3
 from botocore.exceptions import ClientError
 
@@ -10,12 +11,18 @@ logger.setLevel(logging.INFO)
 
 # 初始化 AWS 服務客戶端
 iot_data_client = boto3.client('iot-data')
-ses_client = boto3.client('ses')  # 用 SES 進行精準個人化 Email 發送
+ses_client = boto3.client('ses')  
 
 # 讀取環境變數配置
 DEFAULT_LOCATION = os.environ.get('DEFAULT_LOCATION', 'A')
 DEFAULT_THING_NAME = os.environ.get('DEFAULT_THING_NAME', 'locker-pi')
 SES_VERIFIED_SOURCE_EMAIL = os.environ.get('SES_SOURCE_EMAIL', 'noreply@yourdomain.com')
+
+
+def generate_otp() -> str:
+    """使用 secrets 模組安全產生 000000-999999 之間的 6 位數密碼字串"""
+    random_number = secrets.randbelow(1000000)
+    return f"{random_number:06d}"
 
 
 def update_iot_device_shadow(number: int, otp: str):
@@ -47,38 +54,24 @@ def update_iot_device_shadow(number: int, otp: str):
         raise e
 
 
-def send_email_via_ses(to_email: str, location: str, number: int, otp: str):
+def send_email_via_ses(to_email: str, subject: str, body_text: str, location: str, number: int):
     """
-    透過 AWS SES 發送一次性密碼通知信給預約的使用者
+    透過 AWS SES 發送個人化通知信給預約的使用者
     """
     if not to_email:
         logger.warning(f"缺少收件人 Email，跳過郵件發送流程。櫃位: {location}-{number}")
         return
 
-    # 定義個人化郵件內容
-    subject_text = "【智慧儲物櫃】您的預約已成功與取件密碼通知"
-    body_text = (
-        f"親愛的使用者您好：\n\n"
-        f"您的智慧儲物櫃預約已確認成功！相關取件資訊如下：\n"
-        f"----------------------------------------\n"
-        f" 儲物櫃地點: {location}\n"
-        f" 櫃位編號: {number} 號櫃\n"
-        f" 一次性取件密碼 (OTP): {otp}\n"
-        f"----------------------------------------\n"
-        f"提示：取件密碼自預約成功起算 5 分鐘內有效，請儘速至現場操作開櫃。\n"
-        f"本信件為系統自動發送，請勿直接回覆。"
-    )
-
     try:
-        logger.info(f"正在透過 SES 發送密碼信件至: {to_email}")
+        logger.info(f"正在透過 SES 發送信件至: {to_email}")
         ses_client.send_email(
-            Source=SES_VERIFIED_SOURCE_EMAIL,  # 必須是您在 AWS SES 控制台驗證過的電子信箱或網域
+            Source=SES_VERIFIED_SOURCE_EMAIL,
             Destination={
                 'ToAddresses': [to_email]
             },
             Message={
                 'Subject': {
-                    'Data': subject_text,
+                    'Data': subject,
                     'Charset': 'UTF-8'
                 },
                 'Body': {
@@ -92,13 +85,14 @@ def send_email_via_ses(to_email: str, location: str, number: int, otp: str):
         logger.info(f"SES 郵件發送成功！收件人: {to_email}")
     except ClientError as e:
         logger.error(f"AWS SES 發送信件失敗: {e.response['Error']['Message']}")
-        # 拋出異常，讓 SQS 觸發重試機制
         raise e
 
 
 def lambda_handler(event, context):
     """
     Worker 主要入口點，監聽 SQS 佇列事件。
+    1. exec-booking 後的初始密碼派發 (不帶 action 或 action='send_initial_otp')
+    2. Shadow 關門觸發的更換新使用者密碼 (action='refresh_user_otp')
     """
     records = event.get('Records', [])
     logger.info(f"收到來自 SQS 的事件，包含 {len(records)} 筆訊息")
@@ -109,30 +103,58 @@ def lambda_handler(event, context):
         try:
             # 解析來自 SQS Body 的 JSON 資料
             body = json.loads(record.get('body', '{}'))
+            action = body.get('action', 'send_initial_otp')
             location = body.get('location', DEFAULT_LOCATION)
             number = body.get('number')
-            otp = body.get('otp')
             user_email = body.get('email')
 
             # 基礎防禦性檢查
-            if number is None or not otp:
-                logger.error(f"[Message ID: {message_id}] SQS 訊息核心欄位缺失，跳過處理。Body: {body}")
+            if number is None:
+                logger.error(f"[Message ID: {message_id}] SQS 訊息缺少櫃位編號，跳過處理。")
                 continue
 
-            logger.info(f"[Message ID: {message_id}] 開始執行非同步任務 -> 櫃位: {location}-{number}")
+            logger.info(f"[Message ID: {message_id}] 開始執行動作 [{action}] -> 櫃位: {location}-{number}")
 
-            # 同步更新 IoT Core Named Shadow
+            # 根據不同的業務動作，決定密碼獲取方式與信件模板
+            if action == "refresh_user_otp":
+                # 外送員關門後，Worker 端主動產生全新的一次性取件碼，徹底阻斷外送員回頭開櫃的可能性
+                otp = generate_otp()
+                subject_text = "【智慧儲物櫃】餐點已送達！請憑新密碼取件"
+                mail_body_prefix = "外送員已將您的餐點安全放入櫃中！"
+            else:
+                # exec-booking 流程，直接拿前端上傳、已經定義好的預約密碼
+                otp = generate_otp()
+                subject_text = "【智慧儲物櫃】您的預約已成功與取件密碼通知"
+                mail_body_prefix = "您的智慧儲物櫃預約已確認成功！相關取件資訊如下："
+
+            # 密碼二次防禦檢查
+            if not otp:
+                logger.error(f"[Message ID: {message_id}] 動作 [{action}] 無法取得有效密碼，跳過處理。")
+                continue
+
+            # 覆寫 IoT Core Named Shadow
             update_iot_device_shadow(int(number), otp)
 
-            # 發送 Email 通知信給使用者
-            send_email_via_ses(user_email, location, int(number), otp)
+            body_text = (
+                f"親愛的使用者您好：\n\n"
+                f"{mail_body_prefix}\n"
+                f"----------------------------------------\n"
+                f" 儲物櫃地點: {location}\n"
+                f" 櫃位編號: {number} 號櫃\n"
+                f" 最新取件密碼 (OTP): {otp}\n"
+                f"----------------------------------------\n"
+                f"提示：為保障財產安全，此密碼為專屬一次性取件碼，外送員無法再次開啟。\n"
+                f"本信件為系統自動發送，請勿直接回覆。"
+            )
 
-            logger.info(f"[Message ID: {message_id}] 該筆預約的硬體同步與信件通知已全部完成！")
+            # 發送 Email 通知信給使用者
+            send_email_via_ses(user_email, subject_text, body_text, location, int(number))
+
+            logger.info(f"[Message ID: {message_id}] 櫃位 {location}-{number} 的處理流程 [{action}] 已全部順利完成！")
 
         except Exception as e:
-            # 攔截任何未預期或 AWS 服務錯誤
+            # 攔截任何錯誤，拋出 Exception 讓 SQS 重新排隊重試
             logger.error(f"[Message ID: {message_id}] 處理訊息時發生錯誤: {str(e)}", exc_info=True)
-            # 拋出 Exception，告訴 SQS 這次失敗了，SQS 會在可見性逾時到期後重新派發該訊息進行重試
             raise e
 
     return {
