@@ -2,7 +2,6 @@ import json
 import os
 import logging
 import time
-import secrets
 import boto3
 from botocore.exceptions import ClientError
 
@@ -27,11 +26,6 @@ TRANSACTION_TABLE_NAME = os.environ.get('TRANSACTION_TABLE', 'LockerTransactions
 transaction_table = dynamodb.Table(TRANSACTION_TABLE_NAME)
 
 repo = LockerRepository()
-
-def generate_otp() -> str:
-    """使用 secrets 模組安全產生 000000-999999 之間的 6 位數密碼字串"""
-    random_number = secrets.randbelow(1000000)
-    return f"{random_number:06d}"
 
 def lambda_handler(event, context):
     """
@@ -64,6 +58,7 @@ def lambda_handler(event, context):
     except Exception as e:
         logger.error(f"伺服器內部錯誤: {str(e)}", exc_info=True)
         return ResponseFormatter.error("系統發生未預期錯誤，請稍後再試", 500)
+
 
 def handle_start_booking(event, location, number):
     """發起預約負責將櫃位保留，並啟動超時倒數工作流。"""
@@ -104,6 +99,7 @@ def handle_start_booking(event, location, number):
         repo.update_locker_status(location, number, 'Available', expected_status='SoftLocked')
         return ResponseFormatter.error("系統繁忙，無法建立預約事務", 500)
 
+
 def get_transaction_with_retry(execution_arn, max_retries=4, delay=0.25):
     """因 Step Functions 產生 Token 寫入 DB 是非同步的，需要給予微小緩衝時間。"""
     for i in range(max_retries):
@@ -117,6 +113,7 @@ def get_transaction_with_retry(execution_arn, max_retries=4, delay=0.25):
             
         time.sleep(delay)
     return None
+
 
 def handle_exec_booking(event, location, number):
     """確認預約，負責換取 Token、喚醒狀態機, 並將櫃位最終確定為 Reserved。"""
@@ -145,12 +142,8 @@ def handle_exec_booking(event, location, number):
     user_email = claims.get('email')
     
     if not user_email:
-        # 資安或環境配置警訊：如果 Token 沒帶 email
         logger.warning(f"警告：無法從使用者 {uid} 的 Token 中解析出 email 屬性！")
 
-    # 產生一次性密碼 OTP
-    otp_password = generate_otp()
-    
     # 更新資料庫資源狀態: SoftLocked -> Reserved
     try:
         repo.update_locker_status(
@@ -183,23 +176,22 @@ def handle_exec_booking(event, location, number):
         logger.error(f"通知狀態機時發生未預期錯誤: {str(e)}", exc_info=True)
         return ResponseFormatter.error("系統內部錯誤", 500)
 
-    # 將 OTP、櫃位資訊以及 email 共同打包推送至 SQS
+    # 將任務描述封裝，推送至 SQS 佇列
     if SQS_QUEUE_URL:
         sqs_payload = {
+            "action": "send_initial_otp",
             "location": location,
             "number": number,
-            "otp": otp_password,
             "email": user_email
         }
         try:
-            logger.info(f"正在將預約資料與 Email 送往 SQS 佇列: {sqs_payload}")
+            logger.info(f"正在將預約請求與 Email 送往 SQS 佇列: {sqs_payload}")
             sqs_client.send_message(
                 QueueUrl=SQS_QUEUE_URL,
                 MessageBody=json.dumps(sqs_payload)
             )
         except ClientError as e:
-            # 記錄高風險日誌（萬一SQS失敗，由於DB沒存密碼，必須留下紀錄供後台稽核）
-            logger.critical(f"無法寫入 SQS! 櫃位 {location}-{number} 的 OTP {otp_password} 可能無法發送。錯誤: {str(e)}")
+            logger.critical(f"無法寫入 SQS! 櫃位 {location}-{number} 的初始預約訊息可能丟失。錯誤: {str(e)}")
     else:
         logger.error("環境變數 SQS_QUEUE_URL 尚未配置，跳過 SQS 推送。")
 
