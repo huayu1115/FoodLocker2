@@ -3,6 +3,7 @@ import os
 import logging
 import secrets
 import boto3
+from datetime import datetime
 from botocore.exceptions import ClientError
 
 # 初始化日誌紀錄器
@@ -25,24 +26,33 @@ def generate_otp() -> str:
     return f"{random_number:06d}"
 
 
-def update_iot_device_shadow(number: int, otp: str):
+def update_iot_device_shadow(number: int, otp: str, action: str):
     """
-    同步更新 AWS IoT Core 上的 Named Shadow 密碼與狀態
+    同步更新 AWS IoT Core 上的 Named Shadow 密碼與狀態。
+    直接在函式內部根據 action 決定 Payload 結構。
     """
     thing_name = DEFAULT_THING_NAME
     shadow_name = str(number)
 
+    # 在函式內部做業務邏輯判斷
+    if action == "refresh_user_otp":
+        desired_state = {
+            "password": otp
+        }
+    else:
+        desired_state = {
+            "password": otp,
+            "status": "reserved"
+        }
+
     shadow_payload = {
         "state": {
-            "desired": {
-                "password": otp,
-                "status": "reserved"
-            }
+            "desired": desired_state
         }
     }
 
     try:
-        logger.info(f"正在更新 IoT Device Shadow. ThingName: {thing_name}, ShadowName: {shadow_name}")
+        logger.info(f"正在更新 IoT Device Shadow. ThingName: {thing_name}, ShadowName: {shadow_name}, Action: {action}")
         iot_data_client.update_thing_shadow(
             thingName=thing_name,
             shadowName=shadow_name,
@@ -119,12 +129,12 @@ def lambda_handler(event, context):
             if action == "refresh_user_otp":
                 # 外送員關門後，Worker 端主動產生全新的一次性取件碼，徹底阻斷外送員回頭開櫃的可能性
                 otp = generate_otp()
-                subject_text = "【智慧儲物櫃】餐點已送達！請憑新密碼取件"
+                subject_text = f"【智慧儲物櫃】餐點已送達！請憑新密碼取件(密碼: {otp})"
                 mail_body_prefix = "外送員已將您的餐點安全放入櫃中！"
             else:
                 # exec-booking 流程，直接拿前端上傳、已經定義好的預約密碼
                 otp = generate_otp()
-                subject_text = "【智慧儲物櫃】您的預約已成功與取件密碼通知"
+                subject_text = f"【智慧儲物櫃】您的預約已成功與取件密碼通知(密碼: {otp})"
                 mail_body_prefix = "您的智慧儲物櫃預約已確認成功！相關取件資訊如下："
 
             # 密碼二次防禦檢查
@@ -133,19 +143,27 @@ def lambda_handler(event, context):
                 continue
 
             # 覆寫 IoT Core Named Shadow
-            update_iot_device_shadow(int(number), otp)
+            update_iot_device_shadow(int(number), otp, action)
 
-            body_text = (
-                f"親愛的使用者您好：\n\n"
-                f"{mail_body_prefix}\n"
-                f"----------------------------------------\n"
-                f" 儲物櫃地點: {location}\n"
-                f" 櫃位編號: {number} 號櫃\n"
-                f" 最新取件密碼 (OTP): {otp}\n"
-                f"----------------------------------------\n"
-                f"提示：為保障財產安全，此密碼為專屬一次性取件碼，外送員無法再次開啟。\n"
-                f"本信件為系統自動發送，請勿直接回覆。"
-            )
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            email_lines = [
+                "親愛的使用者您好：",
+                "",  # 空白行
+                f"{mail_body_prefix}",
+                "----------------------------------------",
+                f" 儲物櫃地點: {location}",
+                f" 櫃位編號: {number} 號櫃",
+                f" 最新取件密碼 (OTP): {otp}",
+                f" 通知發送時間: {current_time}",
+                "----------------------------------------",
+                "",  # 空白行
+                "提示：為保障財產安全，此密碼為專屬一次性取件碼，外送員無法再次開啟。",
+                "本信件為系統自動發送，請勿直接回覆。"
+            ]
+
+            # 使用一個安全斷行 \n 進行完美串接
+            body_text = "\n".join(email_lines)
 
             # 發送 Email 通知信給使用者
             send_email_via_ses(user_email, subject_text, body_text, location, int(number))
